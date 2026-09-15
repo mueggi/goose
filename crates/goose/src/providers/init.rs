@@ -23,6 +23,7 @@ use super::{
     gemini_cli::GeminiCliProvider,
     gemini_oauth::GeminiOAuthProvider,
     githubcopilot::GithubCopilotProvider,
+    golem_oauth::GolemOAuthProvider,
     gondola::GondolaProvider,
     huggingface::HuggingFaceProvider,
     kimicode::KimiCodeProvider,
@@ -122,6 +123,10 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
             false,
             Some(registrations::refresh_only()),
         );
+        registry.register_with_inventory::<GolemOAuthProvider>(
+            false,
+            Some(registrations::golem_oauth_inventory()),
+        );
         registry.register::<GondolaProvider>(false);
         registry.register_with_inventory::<GoogleProviderDef>(
             true,
@@ -209,6 +214,10 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
     registry.set_cleanup(
         "xai_oauth",
         Arc::new(|| Box::pin(XaiOAuthProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "golem",
+        Arc::new(|| Box::pin(GolemOAuthProvider::cleanup())),
     );
     registry.set_cleanup(
         "huggingface",

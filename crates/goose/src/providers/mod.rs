@@ -40,6 +40,7 @@ pub mod gcpvertexai;
 pub mod gemini_cli;
 pub mod gemini_oauth;
 pub mod githubcopilot;
+pub mod golem_oauth;
 pub mod google {
     pub use goose_providers::google::*;
 }
