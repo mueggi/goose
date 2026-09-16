@@ -6,12 +6,28 @@ use crate::oauth::{oauth_flow, GooseCredentialStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use goose_providers::context_limit::ContextLimitResolver;
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
 use rmcp::model::Tool;
 use rmcp::transport::auth::{AuthError, AuthorizationManager, CredentialStore};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+
+/// Bound on the one-time live `/models` fetch `get_context_limit` uses to
+/// discover per-model context windows, so a slow/unreachable gateway can't
+/// stall whatever's calling it (e.g. lead/worker handoff, compaction
+/// triggers) — mirrors `ollama_cloud.rs`'s `SHOW_INFO_TIMEOUT`.
+const CONTEXT_LIMIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a failed context-limit discovery attempt is remembered before
+/// retrying. `get_context_limit` is on the default tool-call-cutoff path and
+/// gets called every lead turn, so without this a broken/unreachable gateway
+/// would pay the full discovery timeout on every single call instead of
+/// just the first.
+const CONTEXT_LIMIT_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Self-hosted inference gateway authenticated via discovery-driven
 /// OAuth/OIDC (RFC 8414 authorization-server discovery + RFC 7591 dynamic
@@ -56,6 +72,68 @@ pub(crate) const GOLEM_OAUTH_CREDENTIAL_NAME: &str = "golem-llm-provider";
 /// actually registered.
 fn oauth_discovery_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+/// The subset of a golem `/models` entry this cares about. Context length
+/// lives under a golem-specific `golem` object, not the standard OpenAI
+/// model fields — e.g. `{"id": "cheapestinference/minimax-m3", "golem":
+/// {"context_length": 1000000, ...}}`. Each entry is a different upstream
+/// model behind the same gateway, so this can't be a fixed per-provider
+/// constant the way a single-model provider's would be.
+#[derive(serde::Deserialize)]
+struct GolemModelEntry {
+    id: String,
+    #[serde(default)]
+    golem: Option<GolemModelExtra>,
+}
+
+#[derive(serde::Deserialize)]
+struct GolemModelExtra {
+    #[serde(default)]
+    context_length: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct GolemModelsResponse {
+    data: Vec<GolemModelEntry>,
+}
+
+fn parse_context_limits(body: &[u8]) -> Result<HashMap<String, usize>> {
+    let response: GolemModelsResponse = serde_json::from_slice(body)?;
+    Ok(response
+        .data
+        .into_iter()
+        .filter_map(|entry| {
+            let context_length = entry.golem?.context_length?;
+            (context_length > 0).then_some((entry.id, context_length))
+        })
+        .collect())
+}
+
+/// Fetches golem's `/models` listing and extracts each model's reported
+/// context length. A plain GET with the caller's already-issued token —
+/// this intentionally bypasses `OpenAiCompatibleProvider`/`ApiClient`'s
+/// request helpers, whose `fetch_supported_models` only keeps each entry's
+/// `id` and discards everything else, since that's the generic
+/// OpenAI-compatible contract every other provider relies on. It still
+/// reuses the *client* those helpers use (via `ApiClient::http_client()`),
+/// not a bare `reqwest::Client::new()`, so a custom CA/client cert
+/// configured for this provider's TLS is honored here too — otherwise
+/// discovery would silently fail (and fall back to the default context
+/// limit) in exactly the deployments most likely to run a self-hosted
+/// gateway like golem behind a private CA.
+async fn fetch_context_limits(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+) -> Result<HashMap<String, usize>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = http_client.get(&url).bearer_auth(token).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("golem models endpoint returned {}", response.status());
+    }
+    let body = response.bytes().await?;
+    parse_context_limits(&body)
 }
 
 struct GolemAuthProvider {
@@ -119,6 +197,17 @@ impl AuthProvider for GolemAuthProvider {
     }
 }
 
+/// Caches the outcome of the last context-limit discovery attempt: either
+/// the fetched map (kept for the provider's lifetime — golem's model list
+/// doesn't change within a session), or when a failed attempt last
+/// happened, so repeated calls against a broken gateway back off instead of
+/// paying the full discovery timeout every time.
+#[derive(Default)]
+struct ContextLimitCache {
+    limits: Option<HashMap<String, usize>>,
+    failed_at: Option<std::time::Instant>,
+}
+
 /// Delegating Provider that forwards chat/stream/etc. to an inner
 /// `OpenAiCompatibleProvider` pointed at the golem base URL, but overrides
 /// `configure_oauth` so the desktop "Sign in" button (and `goose configure`)
@@ -129,9 +218,57 @@ pub struct GolemOAuthProvider {
     inner: OpenAiCompatibleProvider,
     #[serde(skip)]
     auth: Arc<GolemAuthProvider>,
+    /// The same TLS-configured client `inner`'s `ApiClient` uses, captured
+    /// at construction time so context-limit discovery honors a custom
+    /// CA/client cert too instead of an unconfigured `reqwest::Client::new()`.
+    #[serde(skip)]
+    http_client: reqwest::Client,
+    #[serde(skip)]
+    context_limits: TokioMutex<ContextLimitCache>,
 }
 
 impl GolemOAuthProvider {
+    async fn cached_context_limits(&self) -> Result<HashMap<String, usize>, ProviderError> {
+        {
+            let cache = self.context_limits.lock().await;
+            if let Some(limits) = cache.limits.as_ref() {
+                return Ok(limits.clone());
+            }
+            if cache
+                .failed_at
+                .is_some_and(|failed_at| failed_at.elapsed() < CONTEXT_LIMIT_FAILURE_COOLDOWN)
+            {
+                return Err(ProviderError::RequestFailed(
+                    "golem context-limit discovery failed recently; not retrying yet".to_string(),
+                ));
+            }
+        }
+
+        let result: Result<HashMap<String, usize>, ProviderError> = async {
+            let token = self.auth.get_valid_token().await?;
+            tokio::time::timeout(
+                CONTEXT_LIMIT_DISCOVERY_TIMEOUT,
+                fetch_context_limits(&self.http_client, &self.auth.base_url, &token),
+            )
+            .await
+            .map_err(|_| {
+                ProviderError::RequestFailed("golem context-limit discovery timed out".to_string())
+            })?
+            .map_err(|e| ProviderError::RequestFailed(e.to_string()))
+        }
+        .await;
+
+        let mut cache = self.context_limits.lock().await;
+        match &result {
+            Ok(limits) => {
+                cache.limits = Some(limits.clone());
+                cache.failed_at = None;
+            }
+            Err(_) => cache.failed_at = Some(std::time::Instant::now()),
+        }
+        result
+    }
+
     pub async fn cleanup() -> Result<()> {
         let name = GOLEM_OAUTH_CREDENTIAL_NAME.to_string();
         GooseCredentialStore::new(name).clear().await?;
@@ -161,6 +298,17 @@ impl Provider for GolemOAuthProvider {
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         self.auth.get_valid_token().await?;
         self.inner.fetch_supported_models().await
+    }
+
+    async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
+        ContextLimitResolver::new(self.get_name())
+            .resolve(model, override_limit, || async {
+                match self.cached_context_limits().await {
+                    Ok(limits) => Ok(limits.get(model).copied()),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
     }
 
     async fn configure_oauth(&self) -> Result<(), ProviderError> {
@@ -215,6 +363,7 @@ impl ProviderDef for GolemOAuthProvider {
                 tls_config,
             )?
             .with_request_builder(crate::session_context::session_id_request_builder());
+            let http_client = api_client.http_client();
 
             let inner = OpenAiCompatibleProvider::new(
                 GOLEM_PROVIDER_NAME.to_string(),
@@ -222,7 +371,12 @@ impl ProviderDef for GolemOAuthProvider {
                 String::new(),
             );
 
-            Ok(Self { inner, auth })
+            Ok(Self {
+                inner,
+                auth,
+                http_client,
+                context_limits: TokioMutex::new(ContextLimitCache::default()),
+            })
         })
     }
 }
@@ -242,6 +396,56 @@ impl AuthProvider for SharedAuthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Fixture from a real `/models` response (agent.asanti.dev, 2026-09-16):
+    // context_length lives under a golem-specific `golem` object, not any
+    // standard OpenAI model field, and each entry is a different upstream
+    // model — golem is a gateway over many, not a single-model provider.
+    #[test]
+    fn parse_context_limits_reads_the_golem_specific_field() {
+        let body = br#"{
+            "data": [
+                {
+                    "id": "cheapestinference/minimax-m3",
+                    "object": "model",
+                    "owned_by": "cheapestinference",
+                    "created": 0,
+                    "golem": {
+                        "upstream_id": "minimax-m3",
+                        "provider": "cheapestinference",
+                        "context_length": 1000000,
+                        "price": {"flat_rate": true},
+                        "max_parallel": 3
+                    }
+                }
+            ]
+        }"#;
+
+        let limits = parse_context_limits(body).unwrap();
+
+        assert_eq!(
+            limits.get("cheapestinference/minimax-m3").copied(),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn parse_context_limits_skips_entries_missing_the_golem_field() {
+        let body = br#"{"data": [{"id": "some/model", "object": "model", "owned_by": "x", "created": 0}]}"#;
+
+        let limits = parse_context_limits(body).unwrap();
+
+        assert!(limits.is_empty());
+    }
+
+    #[test]
+    fn parse_context_limits_skips_a_zero_context_length() {
+        let body = br#"{"data": [{"id": "some/model", "object": "model", "owned_by": "x", "created": 0, "golem": {"context_length": 0}}]}"#;
+
+        let limits = parse_context_limits(body).unwrap();
+
+        assert!(limits.is_empty());
+    }
 
     // Regression test: `crate::oauth::oauth_flow`/`GooseCredentialStore` key
     // stored credentials by a flat string name shared with MCP extension
@@ -315,6 +519,8 @@ mod tests {
                 String::new(),
             ),
             auth,
+            http_client: reqwest::Client::new(),
+            context_limits: TokioMutex::new(ContextLimitCache::default()),
         };
 
         let error = provider
