@@ -126,7 +126,7 @@ pub async fn handle_info(verbose: bool, check: bool) -> Result<()> {
         + 4;
 
     println!("{}", style("goose Version:").cyan().bold());
-    print_aligned("Version:", env!("CARGO_PKG_VERSION"), label_padding);
+    print_aligned("Version:", crate::cli::goose_build_version(), label_padding);
     println!();
 
     println!("{}", style("Paths:").cyan().bold());

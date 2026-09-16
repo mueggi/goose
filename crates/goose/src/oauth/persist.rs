@@ -30,6 +30,14 @@ impl GooseCredentialStore {
         format!("oauth_creds_{}", self.name)
     }
 
+    /// Whether credentials are currently stored, without going through the
+    /// async `CredentialStore::load`. Intended for synchronous "is this
+    /// provider configured" checks (e.g. inventory registrations) that would
+    /// otherwise have to duplicate the `oauth_creds_{name}` key format.
+    pub fn has_credentials(&self) -> bool {
+        matches!(self.load_persisted(), Ok(Some(_)))
+    }
+
     fn load_persisted(&self) -> Result<Option<PersistedCredentials>, AuthError> {
         let config = Config::global();
         let key = self.secret_key();
@@ -93,6 +101,20 @@ impl CredentialStore for GooseCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pins the `oauth_creds_{name}` naming convention so callers that need a
+    // synchronous "is this provider configured" check (e.g. inventory
+    // registrations) can rely on `has_credentials()` instead of
+    // reconstructing this key themselves. `Config::global()` is a
+    // process-wide singleton this crate's tests otherwise avoid touching
+    // (see config::base's tests, which always build a scoped `Config`
+    // instead), so this test only pins the key format, not the actual
+    // load/save round-trip through Config::global().
+    #[test]
+    fn secret_key_uses_oauth_creds_prefix() {
+        let store = GooseCredentialStore::new("golem".to_string());
+        assert_eq!(store.secret_key(), "oauth_creds_golem");
+    }
 
     fn credentials() -> StoredCredentials {
         StoredCredentials::new(

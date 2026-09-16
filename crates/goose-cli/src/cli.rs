@@ -66,8 +66,24 @@ impl From<ServePlatform> for GoosePlatform {
     }
 }
 
+/// The reported version, with optional semver build metadata (an RFC-legal
+/// `+...` suffix) appended when `GOOSE_VERSION_SUFFIX` is set at build time.
+/// This lets a local/fork build mark itself (e.g. `GOOSE_VERSION_SUFFIX=+golem-oidc
+/// cargo build ...`) without changing the underlying version number or
+/// affecting a normal build, where the env var is unset and this is
+/// identical to `CARGO_PKG_VERSION`.
+pub fn goose_build_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| match option_env!("GOOSE_VERSION_SUFFIX") {
+            Some(suffix) => format!("{}{}", env!("CARGO_PKG_VERSION"), suffix),
+            None => env!("CARGO_PKG_VERSION").to_string(),
+        })
+        .as_str()
+}
+
 #[derive(Parser)]
-#[command(name = "goose", author, version, display_name = "", about, long_about = None)]
+#[command(name = "goose", author, version = goose_build_version(), display_name = "", about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

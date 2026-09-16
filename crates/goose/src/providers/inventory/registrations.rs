@@ -226,6 +226,15 @@ pub fn xai_oauth_inventory() -> InventoryRegistration {
     .with_configured(|| XaiOAuthTokenCache::new().has_token())
 }
 
+pub fn golem_oauth_inventory() -> InventoryRegistration {
+    refresh_only().with_configured(|| {
+        crate::oauth::GooseCredentialStore::new(
+            crate::providers::golem_oauth::GOLEM_OAUTH_CREDENTIAL_NAME.to_string(),
+        )
+        .has_credentials()
+    })
+}
+
 pub fn acp_inventory(
     provider_id: &'static str,
     command: &'static str,

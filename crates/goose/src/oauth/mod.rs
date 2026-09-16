@@ -37,16 +37,55 @@ pub struct OAuthFlowConfig {
     pub client_metadata_url: Option<String>,
 }
 
+/// Outcome of the OAuth loopback callback: the synthetic callback URL to
+/// hand to `handle_callback_url` on success, or a human-readable error
+/// (from the authorization server's `error`/`error_description`, or a
+/// malformed callback) on failure.
+type CallbackOutcome = Result<String, String>;
+
 #[derive(Clone)]
 struct AppState {
-    callback_receiver: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    callback_receiver: Arc<Mutex<Option<oneshot::Sender<CallbackOutcome>>>>,
 }
 
+// `code`/`state` are optional (not required) so a denied/errored
+// authorization — which omits `code` and carries `error`/`error_description`
+// instead — still deserializes. Requiring them made axum's `Query` extractor
+// reject the request before the handler ever ran, surfacing only "Failed to
+// deserialize query string: missing field `code`" and discarding the
+// server's actual reason.
 #[derive(Debug, Deserialize)]
 struct CallbackParams {
-    code: String,
-    state: String,
+    code: Option<String>,
+    state: Option<String>,
     iss: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Turns the callback's query parameters into either the synthetic callback
+/// URL `handle_callback_url` expects, or a human-readable error — pulled out
+/// of the axum handler so it can be unit tested without a live server.
+fn callback_query_to_result(params: &CallbackParams) -> CallbackOutcome {
+    if let Some(error) = &params.error {
+        return Err(match &params.error_description {
+            Some(description) => format!("{error}: {description}"),
+            None => error.clone(),
+        });
+    }
+
+    let (Some(code), Some(state)) = (&params.code, &params.state) else {
+        return Err("authorization callback did not include a code or an error".to_string());
+    };
+
+    let query = serde_urlencoded::to_string([("code", code.as_str()), ("state", state.as_str())])
+        .unwrap_or_default();
+    let issuer = params
+        .iss
+        .as_deref()
+        .map(|iss| format!("&iss={}", urlencoding::encode(iss)))
+        .unwrap_or_default();
+    Ok(format!("http://callback/oauth_callback?{query}{issuer}"))
 }
 
 fn resolve_oauth_callback_timeout(value: Option<&str>) -> Duration {
@@ -111,17 +150,55 @@ async fn complete_automatic_authorization(
     {
         anyhow::bail!("authorization response redirected to an unexpected callback URI");
     }
-    Ok(Some(callback_url.to_string()))
+
+    // Route through the same code/error handling as the interactive
+    // loopback path, so an authorization server error surfaced here (e.g.
+    // in a test harness driving GOOSE_OAUTH_AUTOMATIC_CALLBACK) gets the
+    // same clear message instead of failing later with a generic
+    // "Authorization callback missing code" once handed to
+    // `handle_callback_url`.
+    let params = callback_params_from_url(&callback_url);
+    let outcome = callback_query_to_result(&params).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some(outcome))
+}
+
+/// Builds `CallbackParams` from a fully-formed callback URL's query string,
+/// for callers (like the automatic-callback test path) that already have a
+/// parsed `url::Url` instead of an incoming HTTP request.
+fn callback_params_from_url(url: &url::Url) -> CallbackParams {
+    let mut params = CallbackParams {
+        code: None,
+        state: None,
+        iss: None,
+        error: None,
+        error_description: None,
+    };
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => params.code = Some(value.into_owned()),
+            "state" => params.state = Some(value.into_owned()),
+            "iss" => params.iss = Some(value.into_owned()),
+            "error" => params.error = Some(value.into_owned()),
+            "error_description" => params.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    params
 }
 
 async fn wait_for_callback(
-    callback_receiver: oneshot::Receiver<String>,
+    callback_receiver: oneshot::Receiver<CallbackOutcome>,
     timeout_duration: Duration,
     name: &str,
     authorization_url: &str,
 ) -> Result<String, anyhow::Error> {
     match tokio::time::timeout(timeout_duration, callback_receiver).await {
-        Ok(Ok(callback_url)) => Ok(callback_url),
+        Ok(Ok(Ok(callback_url))) => Ok(callback_url),
+        Ok(Ok(Err(oauth_error))) => Err(anyhow::anyhow!(
+            "OAuth authorization for {} failed: {}",
+            name,
+            oauth_error
+        )),
         Ok(Err(e)) => Err(anyhow::anyhow!(
             "OAuth authorization for {} ended before the callback was received: {}",
             name,
@@ -409,7 +486,7 @@ pub async fn oauth_flow_with_challenge(
         }
     }
 
-    let (callback_sender, callback_receiver) = oneshot::channel::<String>();
+    let (callback_sender, callback_receiver) = oneshot::channel::<CallbackOutcome>();
     let app_state = AppState {
         callback_receiver: Arc::new(Mutex::new(Some(callback_sender))),
     };
@@ -418,17 +495,7 @@ pub async fn oauth_flow_with_challenge(
         let rendered = rendered.clone();
         async move {
             if let Some(sender) = state.callback_receiver.lock().await.take() {
-                let query = serde_urlencoded::to_string([
-                    ("code", params.code.as_str()),
-                    ("state", params.state.as_str()),
-                ])
-                .unwrap_or_default();
-                let issuer = params
-                    .iss
-                    .as_deref()
-                    .map(|iss| format!("&iss={}", urlencoding::encode(iss)))
-                    .unwrap_or_default();
-                let _ = sender.send(format!("http://callback/oauth_callback?{query}{issuer}"));
+                let _ = sender.send(callback_query_to_result(&params));
             }
             Html(rendered)
         }
@@ -567,7 +634,7 @@ mod tests {
     async fn wait_for_callback_returns_received_callback_url() {
         let (sender, receiver) = oneshot::channel();
         let expected = "http://callback/oauth_callback?code=auth-code&state=csrf-state";
-        sender.send(expected.to_string()).unwrap();
+        sender.send(Ok(expected.to_string())).unwrap();
 
         let callback_url = wait_for_callback(
             receiver,
@@ -579,6 +646,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(callback_url, expected);
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_surfaces_the_authorization_server_error() {
+        let (sender, receiver) = oneshot::channel();
+        sender
+            .send(Err("access_denied: user cancelled".to_string()))
+            .unwrap();
+
+        let error = wait_for_callback(
+            receiver,
+            Duration::from_secs(1),
+            "test-server",
+            "https://auth.example/authorize",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("access_denied: user cancelled"));
     }
 
     #[test]
@@ -603,6 +689,103 @@ mod tests {
         let Query(params) = Query::<CallbackParams>::try_from_uri(&uri).unwrap();
 
         assert_eq!(params.iss, None);
+    }
+
+    // Regression test for a real failure: an authorization server denying
+    // (or otherwise erroring) a request returns `error`/`error_description`
+    // instead of `code`. Requiring `code`/`state` made axum's `Query`
+    // extractor reject the request before this handler ever ran, so the
+    // browser (and the CLI) only ever saw "Failed to deserialize query
+    // string: missing field `code`" — never the server's actual reason.
+    #[test]
+    fn callback_params_accept_an_error_response_without_a_code() {
+        let uri: axum::http::Uri =
+            "http://127.0.0.1/oauth_callback?error=access_denied&error_description=user+cancelled&state=csrf-state"
+                .parse()
+                .unwrap();
+
+        let Query(params) = Query::<CallbackParams>::try_from_uri(&uri).unwrap();
+
+        assert_eq!(params.code, None);
+        assert_eq!(params.error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn callback_params_from_url_extracts_error_fields() {
+        let url = url::Url::parse(
+            "http://127.0.0.1:8765/callback?error=access_denied&error_description=user+cancelled&state=csrf-state",
+        )
+        .unwrap();
+
+        let params = callback_params_from_url(&url);
+
+        assert_eq!(params.code, None);
+        assert_eq!(params.error.as_deref(), Some("access_denied"));
+        assert_eq!(params.error_description.as_deref(), Some("user cancelled"));
+        assert_eq!(params.state.as_deref(), Some("csrf-state"));
+    }
+
+    #[test]
+    fn callback_query_to_result_succeeds_with_code_and_state() {
+        let params = CallbackParams {
+            code: Some("auth-code".to_string()),
+            state: Some("csrf-state".to_string()),
+            iss: None,
+            error: None,
+            error_description: None,
+        };
+
+        let callback_url = callback_query_to_result(&params).unwrap();
+
+        assert_eq!(
+            callback_url,
+            "http://callback/oauth_callback?code=auth-code&state=csrf-state"
+        );
+    }
+
+    #[test]
+    fn callback_query_to_result_surfaces_error_and_description() {
+        let params = CallbackParams {
+            code: None,
+            state: Some("csrf-state".to_string()),
+            iss: None,
+            error: Some("access_denied".to_string()),
+            error_description: Some("user cancelled".to_string()),
+        };
+
+        let error = callback_query_to_result(&params).unwrap_err();
+
+        assert_eq!(error, "access_denied: user cancelled");
+    }
+
+    #[test]
+    fn callback_query_to_result_surfaces_bare_error_without_description() {
+        let params = CallbackParams {
+            code: None,
+            state: None,
+            iss: None,
+            error: Some("invalid_scope".to_string()),
+            error_description: None,
+        };
+
+        let error = callback_query_to_result(&params).unwrap_err();
+
+        assert_eq!(error, "invalid_scope");
+    }
+
+    #[test]
+    fn callback_query_to_result_rejects_a_response_with_neither_code_nor_error() {
+        let params = CallbackParams {
+            code: None,
+            state: Some("csrf-state".to_string()),
+            iss: None,
+            error: None,
+            error_description: None,
+        };
+
+        let error = callback_query_to_result(&params).unwrap_err();
+
+        assert!(error.contains("did not include a code or an error"));
     }
 
     #[test]

@@ -301,6 +301,19 @@ impl ApiClient {
         &self.host
     }
 
+    /// The underlying `reqwest::Client`, already built with this client's
+    /// TLS settings (custom CA/client certs) and timeouts. `reqwest::Client`
+    /// clones cheaply (internally `Arc`-backed). For callers that need to
+    /// make a request outside the normal path-relative
+    /// `request()`/`response_get()` helpers — e.g. hitting an endpoint with
+    /// different auth/response semantics than the provider's main API
+    /// surface — and still want the same TLS trust as the rest of the
+    /// provider's traffic, rather than an unconfigured `reqwest::Client::new()`
+    /// that silently ignores a custom CA.
+    pub fn http_client(&self) -> Client {
+        self.client.clone()
+    }
+
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
