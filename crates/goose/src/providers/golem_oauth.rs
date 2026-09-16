@@ -134,10 +134,8 @@ pub struct GolemOAuthProvider {
 impl GolemOAuthProvider {
     pub async fn cleanup() -> Result<()> {
         let name = GOLEM_OAUTH_CREDENTIAL_NAME.to_string();
-        GooseCredentialStore::new(name)
-            .clear()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
+        GooseCredentialStore::new(name).clear().await?;
+        Ok(())
     }
 }
 

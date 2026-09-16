@@ -150,7 +150,40 @@ async fn complete_automatic_authorization(
     {
         anyhow::bail!("authorization response redirected to an unexpected callback URI");
     }
-    Ok(Some(callback_url.to_string()))
+
+    // Route through the same code/error handling as the interactive
+    // loopback path, so an authorization server error surfaced here (e.g.
+    // in a test harness driving GOOSE_OAUTH_AUTOMATIC_CALLBACK) gets the
+    // same clear message instead of failing later with a generic
+    // "Authorization callback missing code" once handed to
+    // `handle_callback_url`.
+    let params = callback_params_from_url(&callback_url);
+    let outcome = callback_query_to_result(&params).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some(outcome))
+}
+
+/// Builds `CallbackParams` from a fully-formed callback URL's query string,
+/// for callers (like the automatic-callback test path) that already have a
+/// parsed `url::Url` instead of an incoming HTTP request.
+fn callback_params_from_url(url: &url::Url) -> CallbackParams {
+    let mut params = CallbackParams {
+        code: None,
+        state: None,
+        iss: None,
+        error: None,
+        error_description: None,
+    };
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => params.code = Some(value.into_owned()),
+            "state" => params.state = Some(value.into_owned()),
+            "iss" => params.iss = Some(value.into_owned()),
+            "error" => params.error = Some(value.into_owned()),
+            "error_description" => params.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    params
 }
 
 async fn wait_for_callback(
@@ -675,6 +708,21 @@ mod tests {
 
         assert_eq!(params.code, None);
         assert_eq!(params.error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn callback_params_from_url_extracts_error_fields() {
+        let url = url::Url::parse(
+            "http://127.0.0.1:8765/callback?error=access_denied&error_description=user+cancelled&state=csrf-state",
+        )
+        .unwrap();
+
+        let params = callback_params_from_url(&url);
+
+        assert_eq!(params.code, None);
+        assert_eq!(params.error.as_deref(), Some("access_denied"));
+        assert_eq!(params.error_description.as_deref(), Some("user cancelled"));
+        assert_eq!(params.state.as_deref(), Some("csrf-state"));
     }
 
     #[test]
